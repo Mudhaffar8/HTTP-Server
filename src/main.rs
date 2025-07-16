@@ -1,8 +1,15 @@
 use std::{
     collections::HashMap, 
-    io::{BufReader, Read, Write}, 
-    net::{TcpListener, TcpStream}
+    io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream},
+    fs,
+    thread,
+    time::Duration
 };
+
+mod threading;
+
+use crate::threading::ThreadPool;
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -13,26 +20,21 @@ struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub fn new_from_buffer(buffer: &[u8]) -> HttpRequest {
-        let request = String::from_utf8_lossy(&buffer);
-
-        let mut request_lines = request.lines();
-        let mut start_line_split = request_lines.next().unwrap().split_whitespace();
+    pub fn new_from_vec(request_lines: &Vec<String>) -> HttpRequest {
+        let mut start_line_split = request_lines[0].split_whitespace();
 
         let method = start_line_split.next().unwrap();
         let path = start_line_split.next().unwrap();
 
-        let mut headers = HashMap::new();
+        let mut headers: HashMap<String, String> = HashMap::new();
 
-        for line in request_lines {
+        for line in request_lines[1..].iter() {
             if line.is_empty() {
                 break;
             }
             let header_split = line.split(": ").collect::<Vec<&str>>();
 
-            if header_split.len() == 2 {
-                headers.insert(header_split[0].to_owned(), header_split[1].to_owned());
-            }
+            headers.insert(header_split[0].to_owned(), header_split[1].to_owned());
         }
 
         HttpRequest { 
@@ -48,18 +50,38 @@ impl HttpRequest {
 fn handle_client(mut stream: TcpStream) {
     println!("Incoming Connection: {:?}", stream.peer_addr());
 
-    let mut buffer = [0u8; 512];
-    let mut reader = BufReader::new(&stream);
+    let reader = BufReader::new(&stream);
 
-    reader.read(&mut buffer).unwrap();
+    let request_lines = reader
+        .lines()
+        .map(|result| result.unwrap())
+        .take_while(|line| !line.is_empty())
+        .collect();
 
-    let request = HttpRequest::new_from_buffer(&buffer);
 
-    println!("{:#?}", request);
+    let request = HttpRequest::new_from_vec(&request_lines);
+
+    println!("Request: {:#?}", request);
 
 
     match request.path.as_str() {
-        "/" => stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap(),
+        "/" => {
+            let content = fs::read_to_string("./src/main.html").unwrap();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                Content-Length: {}\r\n\r\n\
+                {content}\r\n",
+                content.len()
+            );
+
+            stream.write_all(response.as_bytes()).unwrap() 
+        },
+
+        "/sleep" => { 
+            thread::sleep(Duration::from_secs(5));
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        },
 
         path if path.starts_with("/echo/") => {
             let echo_string = path.strip_prefix("/echo/").unwrap_or_else(|| "");
@@ -91,17 +113,23 @@ fn handle_client(mut stream: TcpStream) {
 
         _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap()
     }    
+    
+    
     stream.flush().unwrap();
 }
 
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+
+    let pool = ThreadPool::new(4);
     
     for stream in listener.incoming() {
         match stream {
             Ok(s) => { 
-                handle_client(s);
+                pool.execute(|| {
+                    handle_client(s);
+                });
             },              
             Err(e) => { println!("Error: {:?}", e); }
         }
