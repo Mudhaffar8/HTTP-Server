@@ -1,10 +1,5 @@
 use std::{
-    collections::HashMap, 
-    io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
-    fs,
-    thread,
-    time::Duration
+    collections::HashMap, fs, hash::Hash, io::{BufReader, Read, Write}, net::{TcpListener, TcpStream}, thread, time::Duration
 };
 
 mod threading;
@@ -19,16 +14,27 @@ struct HttpRequest {
     body: String
 }
 
-impl HttpRequest {
-    pub fn new_from_vec(request_lines: &Vec<String>) -> HttpRequest {
-        let mut start_line_split = request_lines[0].split_whitespace();
+#[allow(dead_code)]
+struct HttpResponse {
+    status_code: String,
+    status_msg : String,
+    headers: HashMap<String, String>,
+    body: String
+}
 
-        let method = start_line_split.next().unwrap();
-        let path = start_line_split.next().unwrap();
+impl HttpRequest {
+    pub fn new_from_vec(buffer: Vec<u8>) -> Self {
+        let request_string = String::from_utf8_lossy(&buffer);
+        let mut request_lines = request_string.lines();
+
+        let mut start_line_split = request_lines.next().unwrap().split_whitespace();
+
+        let method = start_line_split.next().unwrap().to_owned();
+        let path = start_line_split.next().unwrap().to_owned();
 
         let mut headers: HashMap<String, String> = HashMap::new();
 
-        for line in request_lines[1..].iter() {
+        for line in request_lines.by_ref() {
             if line.is_empty() {
                 break;
             }
@@ -37,11 +43,18 @@ impl HttpRequest {
             headers.insert(header_split[0].to_owned(), header_split[1].to_owned());
         }
 
-        HttpRequest { 
-            method: method.to_owned(), 
-            path: path.to_owned(), 
+        let body = if let Some(s) = request_lines.next() { 
+            let len = headers.get("Content-Length").unwrap().parse::<i32>().unwrap() as usize;
+            s[0..len].to_owned()
+        } else { 
+            "".to_owned() 
+        };
+
+        Self { 
+            method,
+            path,
             headers, 
-            body: "".to_owned() 
+            body
         }
     }
 }
@@ -50,70 +63,117 @@ impl HttpRequest {
 fn handle_client(mut stream: TcpStream) {
     println!("Incoming Connection: {:?}", stream.peer_addr());
 
-    let reader = BufReader::new(&stream);
+    let mut buffer = vec![0u8; 512];
+    let mut reader = BufReader::new(&stream);
 
-    let request_lines = reader
-        .lines()
-        .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
+    reader.read(&mut buffer).unwrap();
 
-
-    let request = HttpRequest::new_from_vec(&request_lines);
-
-    println!("Request: {:#?}", request);
+    let request = HttpRequest::new_from_vec(buffer);
 
 
-    match request.path.as_str() {
-        "/" => {
-            let content = fs::read_to_string("./src/main.html").unwrap();
+    if request.method == "GET" {
+        match request.path.as_str() {
+            "/" => {
+                let content = fs::read_to_string("./src/main.html").unwrap();
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                Content-Length: {}\r\n\r\n\
-                {content}\r\n",
-                content.len()
-            );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\r\n\
+                    {content}\r\n",
+                    content.len()
+                );
 
-            stream.write_all(response.as_bytes()).unwrap() 
-        },
+                stream.write_all(response.as_bytes()).unwrap() 
+            },
 
-        "/sleep" => { 
-            thread::sleep(Duration::from_secs(5));
-            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
-        },
+            // Testing multiple threads
+            "/sleep" => { 
+                let content = fs::read_to_string("./src/main.html").unwrap();
 
-        path if path.starts_with("/echo/") => {
-            let echo_string = path.strip_prefix("/echo/").unwrap_or_else(|| "");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\r\n\
+                    {content}\r\n",
+                    content.len()
+                );
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                Content-Type: text/plain\r\n\
-                Content-Length: {}\r\n\r\n\
-                {echo_string}\r\n",
-                echo_string.len()
-            );
+                thread::sleep(Duration::from_secs(5));
 
-            stream.write_all(response.as_bytes()).unwrap();
-        },
+                stream.write_all(response.as_bytes()).unwrap();
+            },
 
-        path if path.starts_with("/user-agent") => {
-            let user_agent = request.headers.get("User-Agent").unwrap().as_str();
+            path if path.starts_with("/echo/") => {
+                let echo_string = path.strip_prefix("/echo/").unwrap_or_else(|| "");
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                Content-Type: text/plain\r\n\
-                Content-Length: {}\r\n\r\n\
-                {user_agent}\r\n",
-                user_agent.len()
-            );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: {}\r\n\r\n\
+                    {echo_string}\r\n",
+                    echo_string.len()
+                );
 
-            stream.write_all(response.as_bytes()).unwrap();
-        },
+                stream.write_all(response.as_bytes()).unwrap();
+            },
 
-        _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap()
-    }    
-    
+            path if path.starts_with("/files/") => {
+                let file_path = format!("/{}", path.strip_prefix("/files/").unwrap_or_else(|| ""));
+
+                match fs::read(file_path.as_str()){
+                    Ok(contents) => {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                            Content-Type: application/octet-stream\r\n\
+                            Content-Length: {}\r\n\r\n\
+                            {:?}\r\n",
+                            contents.len(),
+                            contents
+                        );
+
+                        stream.write_all(response.as_bytes()).unwrap();
+                    },
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+                    } 
+                }
+            },
+
+            path if path.starts_with("/user-agent") => {
+                let user_agent = request.headers.get("User-Agent").unwrap().as_str();
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/plain\r\n\
+                    Content-Length: {}\r\n\r\n\
+                    {user_agent}\r\n",
+                    user_agent.len()
+                );
+
+                stream.write_all(response.as_bytes()).unwrap();
+            },
+
+            _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap()
+        }    
+    } else if request.method == "POST" {
+        match request.path.as_str() {
+            path if path.starts_with("/files/") => {
+                let file_name= format!("/{}", path.strip_prefix("/files/").unwrap_or_else(|| ""));
+
+                match fs::write(file_name, request.body.as_bytes()) {
+                    Ok(_) => stream.write_all(b"HTTP/1.1 201 Created\r\n\r\n").unwrap(),
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+                    }
+                }
+
+            },
+            _ => { 
+                stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+            }
+        }
+    }
     
     stream.flush().unwrap();
 }
