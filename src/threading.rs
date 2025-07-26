@@ -15,11 +15,19 @@ impl Worker {
     pub fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let thread = thread::spawn(move || {
             loop {
-                let job = receiver.lock().unwrap().recv().unwrap();
+                let msg = receiver.lock().unwrap().recv();
+                
+                match msg {
+                    Ok(job) => {
+                        println!("Worker {id} got a job; Executing...");
 
-                println!("Worker {id} got a job; Executing...");
-
-                job();
+                        job();
+                    },
+                    Err(_) => {
+                        println!("Worker {id} shutting!");
+                        break;
+                    }
+                }
             }
         });
         
@@ -55,4 +63,14 @@ impl ThreadPool {
         self.sender.send(job).unwrap();
     }
     
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        for worker in self.threads.drain(..) {
+            println!("Worker {} is shutting down!", worker.id);
+
+            worker.thread.join().unwrap();
+        }
+    }
 }
