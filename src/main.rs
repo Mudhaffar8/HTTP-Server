@@ -1,22 +1,23 @@
+mod threading;
+mod tests;
+mod constants;
+
+extern crate flate2;
+use crate::threading::ThreadPool;
+
+use crate::constants::*;
+
 use std::{
     collections::HashMap, 
     fs, 
-    io::{BufReader, Read, Write}, 
+    io::{BufReader, Read, Write, Error, ErrorKind}, 
     net::{TcpListener, TcpStream}, 
     thread, 
     fmt
 };
 
-
-mod threading;
-mod tests;
-
-use crate::threading::ThreadPool;
-
-const ADDRESS: &'static str = "127.0.0.1:4221";
-const NUM_OF_THREADS: usize = 4;
-
-const VALID_COMPRESSION_MODES: [&'static str; 1] = ["gzip"];
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -26,7 +27,15 @@ struct HttpRequest {
     body: String
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum ParseError {
+    EmptyRequest,
+    EmptyMethod,
+    EmptyPath,
+    EmptyHttpVersion, 
+    InvalidHeader
+}
+
 #[derive(Debug)]
 struct HttpResponse {
     status_code: StatusCode,
@@ -35,7 +44,7 @@ struct HttpResponse {
 }
 
 #[repr(u32)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Copy, Clone)]
 enum StatusCode {
     Ok = 200,
     Created = 201,
@@ -101,30 +110,53 @@ impl fmt::Display for HttpResponse {
 }
 
 impl HttpRequest {
-    pub fn new_from_buffer(buffer: &[u8]) -> Self {
+    pub fn new_from_buffer(buffer: &[u8]) -> Result<Self, ParseError> {
         let request_string = String::from_utf8_lossy(&buffer);
         
         let mut request_lines = request_string.lines();
 
-        let mut start_line_split = request_lines.next().unwrap().split_whitespace();
+        let start_line_split = request_lines.next()
+            .ok_or( ParseError::EmptyRequest)?
+            .to_owned();
 
-        let method = start_line_split.next().unwrap().to_owned();
-        let path = start_line_split.next().unwrap().to_owned();
+        let mut parts = start_line_split.split_whitespace();
 
+        // Check Method exists in string
+        let method = parts.next()
+            .ok_or(ParseError::EmptyMethod)?
+            .to_owned();
+
+            
+        // Check path exists in string
+        let path = parts.next()    
+            .ok_or(ParseError::EmptyPath)?
+            .to_owned();
+
+        // Check if HTTP Version exists
+        let _http_version = parts.next().ok_or(ParseError::EmptyHttpVersion)?;
+        
         let mut headers: HashMap<String, String> = HashMap::new();
 
+        // Parse all Headers and add to Hashmap
         for line in request_lines.by_ref() {
             if line.is_empty() {
                 break;
             }
-            let header_split = line.split(": ").collect::<Vec<&str>>();
-            headers.insert(header_split[0].to_owned(), header_split[1].to_owned());
+
+            let mut header_split = line.split(": ");
+
+            let (Some(key), Some(val)) = (header_split.next(), header_split.next()) else {
+                // Make this continue instead?
+                return Err(ParseError::InvalidHeader);
+            };
+            
+            headers.insert(key.to_owned(), val.to_owned());
         }
 
         let body = if let Some(s) = request_lines.next() { 
             match headers.get("Content-Length") {
                 Some(val) => {
-                    let len = val.parse::<usize>().unwrap();
+                    let len = val.parse::<usize>().unwrap_or_default();
                     s[0..len].to_owned()
                 },
                 None => "".to_owned()
@@ -133,28 +165,50 @@ impl HttpRequest {
             "".to_owned() 
         };
 
-        Self { 
+        Ok(Self { 
             method,
             path,
             headers, 
             body
-        }
+        })
     }
 }
 
+impl fmt::Display for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f,
+            "{} {} HTTP/1.1\r\n\
+            {}\
+            \r\n\
+            {}",
+            self.method,
+            self.path,
+            self.headers.iter().map(|(s, k)| format!("{s}: {k}\r\n")).collect::<String>(),
+            self.body,
+        )
+    }
+}
 
-fn handle_client(mut stream: TcpStream) {
+fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
     println!("Incoming Connection: {:?}", stream.peer_addr());
 
     let mut buffer = [0u8; 1024];
     let mut reader = BufReader::new(&stream);
 
-    reader.read(&mut buffer).unwrap();
-
-
-    let request = HttpRequest::new_from_buffer(&buffer);
+    reader.read(&mut buffer)?;
 
     let mut resp = HttpResponse::new();
+
+    // Return early if Parsing Error
+    let Ok(request) = HttpRequest::new_from_buffer(&buffer) else {
+        resp.set_status_code(StatusCode::BadRequest);
+        println!("{:?}", resp);
+
+        stream.write_all(resp.to_string().as_bytes())?;
+        stream.flush()?;
+
+        return Ok(());
+    };
 
     if request.method == "GET" {
         match request.path.as_str() {
@@ -193,11 +247,20 @@ fn handle_client(mut stream: TcpStream) {
                     }
                 }
 
+                let mut buffer: Vec<u8> = Vec::new();
+
+                let mut encoder = GzEncoder::new(&mut buffer, Compression::default());
+
+                let mut cursor = std::io::Cursor::new(echo_string.as_bytes());
+                std::io::copy(&mut cursor, &mut encoder).unwrap();
+                let compressed = encoder.finish().unwrap();
+
                 resp
                     .set_status_code(StatusCode::Ok)
                     .set_header("Content-Type", "text/plain")
-                    .set_header("Content-Length", echo_string.len().to_string().as_str())
-                    .set_body(echo_string.to_string());
+                    .set_header("Content-Encoding", "gzip")
+                    .set_header("Content-Length", &compressed.len().to_string())
+                    .set_body(String::from_utf8_lossy(&compressed).to_string());
 
             },
 
@@ -248,13 +311,15 @@ fn handle_client(mut stream: TcpStream) {
             _ => { resp.set_status_code(StatusCode::NotFound); }
         }
     } else {
-        resp.set_status_code(StatusCode::NotImplemented);
+        resp.set_status_code(StatusCode::InternalServerError);
     }
 
     println!("{:?}", resp);
 
-    stream.write_all(resp.to_string().as_bytes()).unwrap();
-    stream.flush().unwrap();
+    stream.write_all(resp.to_string().as_bytes())?;
+    stream.flush()?;
+
+    Ok(())
 }
 
 
@@ -267,9 +332,11 @@ fn main() {
         match stream {
             Ok(s) => { 
                 pool.execute(|| {
-                    handle_client(s);
+                    if let Err(e) = handle_client(s) {
+                        println!("{}", e);
+                    }
                 });
-            },              
+            },               
             Err(e) => { println!("Error: {:?}", e); }
         }
     }
