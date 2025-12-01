@@ -3,18 +3,19 @@ mod tests;
 mod constants;
 
 extern crate flate2;
-use crate::threading::ThreadPool;
-
-use crate::constants::*;
 
 use std::{
     collections::HashMap, 
     fs, 
-    io::{BufReader, Read, Write, Error, ErrorKind}, 
+    io::{BufReader, Read, Write}, 
     net::{TcpListener, TcpStream}, 
     thread, 
     fmt
 };
+
+use crate::threading::ThreadPool;
+
+use crate::constants::*;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -24,7 +25,7 @@ struct HttpRequest {
     method: String,
     path: String,
     headers: HashMap<String, String>,
-    body: String
+    body: Vec<u8>
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +41,7 @@ enum ParseError {
 struct HttpResponse {
     status_code: StatusCode,
     headers: HashMap<String, String>,
-    body: String
+    body: Vec<u8>
 }
 
 #[repr(u32)]
@@ -72,7 +73,7 @@ impl HttpResponse {
         Self {
             status_code: StatusCode::Ok,
             headers: HashMap::new(),
-            body: String::new()
+            body: Vec::new()
         }
     }
 
@@ -82,29 +83,44 @@ impl HttpResponse {
         self
     }
 
-    fn set_body(&mut self, body: String) -> &mut Self {
+    fn set_body(&mut self, body: Vec<u8>) -> &mut Self {
         self.body = body;
 
         self
     }
 
-    fn set_header(&mut self, key: &str, val: &str) -> &mut Self {
-        self.headers.insert(key.to_owned(), val.to_owned());
+    fn set_header(&mut self, key: String, val: String) -> &mut Self {
+        self.headers.insert(key, val);
 
         self
     }
+
+    fn as_bytes(&self) -> Vec<u8> {
+        let mut response = Vec::with_capacity(1024);
+
+        response.extend_from_slice(format!("HTTP/1.1 {}\r\n\\", self.status_code).as_bytes());
+
+        for (key, val) in self.headers.iter() {
+            response.extend_from_slice(format!("{key}: {val}\r\n").as_bytes());
+        }   
+
+        response.extend_from_slice(b"\r\n");
+
+        response.extend_from_slice(self.body.as_slice());   
+          
+        response 
+    }
 }
 
+// Strictly for Debugging
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
             "HTTP/1.1 {}\r\n\
             {}\
-            \r\n\
-            {}",
+            \r\n",
             self.status_code.to_string(),
             self.headers.iter().map(|(s, k)| format!("{s}: {k}\r\n")).collect::<String>(),
-            self.body,
         )
     }
 }
@@ -116,7 +132,7 @@ impl HttpRequest {
         let mut request_lines = request_string.lines();
 
         let start_line_split = request_lines.next()
-            .ok_or( ParseError::EmptyRequest)?
+            .ok_or(ParseError::EmptyRequest)?
             .to_owned();
 
         let mut parts = start_line_split.split_whitespace();
@@ -134,7 +150,7 @@ impl HttpRequest {
 
         // Check if HTTP Version exists
         let _http_version = parts.next().ok_or(ParseError::EmptyHttpVersion)?;
-        
+
         let mut headers: HashMap<String, String> = HashMap::new();
 
         // Parse all Headers and add to Hashmap
@@ -153,17 +169,16 @@ impl HttpRequest {
             headers.insert(key.to_owned(), val.to_owned());
         }
 
-        let body = if let Some(s) = request_lines.next() { 
-            match headers.get("Content-Length") {
-                Some(val) => {
+        let body = request_lines.next()
+            .and_then(|s| 
+                headers.get("Content-Length").and_then(|val| {
                     let len = val.parse::<usize>().unwrap_or_default();
-                    s[0..len].to_owned()
-                },
-                None => "".to_owned()
-            } 
-        } else { 
-            "".to_owned() 
-        };
+                    Some(s[0..len].to_owned())
+                })
+            )
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
 
         Ok(Self { 
             method,
@@ -174,17 +189,16 @@ impl HttpRequest {
     }
 }
 
+// Strictly for Debugging
 impl fmt::Display for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
             "{} {} HTTP/1.1\r\n\
             {}\
-            \r\n\
-            {}",
+            \r\n",
             self.method,
             self.path,
             self.headers.iter().map(|(s, k)| format!("{s}: {k}\r\n")).collect::<String>(),
-            self.body,
         )
     }
 }
@@ -210,70 +224,70 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
         return Ok(());
     };
 
+
     if request.method == "GET" {
         match request.path.as_str() {
             "/" => {
-                let contents = fs::read_to_string("./src/main.html").unwrap();
-                let len = contents.len().to_string();
+                let contents = fs::read(PATH_TO_HOMEPAGE).unwrap_or_default();
+                let len = contents.len();
 
                 resp
                     .set_status_code(StatusCode::Ok)
-                    .set_header("Content-Length", len.as_str())
+                    .set_header("Content-Length".to_owned(), len.to_string())
                     .set_body(contents);
             },
 
             // For testing concurrency
             "/sleep" => { 
-                let content = fs::read_to_string("./src/main.html").unwrap();
-                let len = content.len().to_string();
+                let content = fs::read(PATH_TO_HOMEPAGE).unwrap_or_default();
+                let len = content.len();
 
                 resp
                     .set_status_code(StatusCode::Ok)
-                    .set_header("Content-Length", len.as_str())
+                    .set_header("Content-Length".to_owned(), len.to_string())
                     .set_body(content);
 
                 thread::sleep(std::time::Duration::from_secs(5));
             },
 
             path if path.starts_with("/echo/") => {
-                let echo_string = path.strip_prefix("/echo/").unwrap_or_else(|| "");
+                let echo_string = path.strip_prefix("/echo/").unwrap_or("");
 
+                // TODO: Move Compression code into set_body method
                 if let Some(val) = request.headers.get("Accept-Encoding") {
                     for compression in val.split(", ") {
                         if compression == "gzip" {
-                            // Actually implement compression modes :)
-                            resp.set_header("Content-Encoding", "gzip");
+                            resp.set_header("Content-Encoding".to_owned(), "gzip".to_owned());
                         }
                     }
                 }
 
-                let mut buffer: Vec<u8> = Vec::new();
+                let mut encoder: GzEncoder<Vec<u8>> = GzEncoder::new(Vec::new(), Compression::default());
 
-                let mut encoder = GzEncoder::new(&mut buffer, Compression::default());
+                encoder.write_all(echo_string.as_bytes())?;
+                let compressed_data = encoder.finish()?;
 
-                let mut cursor = std::io::Cursor::new(echo_string.as_bytes());
-                std::io::copy(&mut cursor, &mut encoder).unwrap();
-                let compressed = encoder.finish().unwrap();
+                //println!("{:?}", compressed_data);
 
                 resp
                     .set_status_code(StatusCode::Ok)
-                    .set_header("Content-Type", "text/plain")
-                    .set_header("Content-Encoding", "gzip")
-                    .set_header("Content-Length", &compressed.len().to_string())
-                    .set_body(String::from_utf8_lossy(&compressed).to_string());
+                    .set_header("Content-Type".to_owned(), "text/plain".to_owned())
+                    .set_header("Content-Encoding".to_owned(), "gzip".to_owned())
+                    .set_header("Content-Length".to_owned(), compressed_data.len().to_string())
+                    .set_body(compressed_data);
 
             },
 
             path if path.starts_with("/files/") => {
-                let file_path = format!("/{}", path.strip_prefix("/files/").unwrap_or_else(|| ""));
+                let file_path = format!("/tmp/{}", path.strip_prefix("/files/").unwrap_or_default());
 
                 match fs::read(file_path.as_str()){
                     Ok(contents) => {
                         resp
                             .set_status_code(StatusCode::Ok)
-                            .set_header("Content-Type", "application/octet-stream")
-                            .set_header("", contents.len().to_string().as_str())
-                            .set_body(String::from_utf8(contents).unwrap()); // FIX ME
+                            .set_header("Content-Type".to_owned(), "application/octet-stream".to_owned())
+                            .set_header("Content-Length".to_owned(), contents.len().to_string())
+                            .set_body(contents); 
                     },
                     Err(e) => {
                         println!("Error: {}", e);
@@ -283,23 +297,31 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
             },
 
             path if path.starts_with("/user-agent") => {
-                let user_agent = request.headers.get("User-Agent").unwrap();
+                let user_agent: Vec<u8> = request.headers.get("User-Agent")
+                    .unwrap_or(&"".to_owned()) 
+                    .as_bytes()
+                    .to_vec();
 
                 resp
                     .set_status_code(StatusCode::Ok)
-                    .set_header("Content-Type", "text/plain")
-                    .set_header("Content-Length", user_agent.len().to_string().as_str())
-                    .set_body(user_agent.clone());
+                    .set_header("Content-Type".to_owned(), "text/plain".to_owned())
+                    .set_header("Content-Length".to_owned(), user_agent.len().to_string())
+                    .set_body(user_agent);
             },
 
-            _ => { resp.set_status_code(StatusCode::NotImplemented); }
+            _ => { 
+                resp.set_status_code(StatusCode::NotImplemented); 
+                //println!("{}", request.path);
+            }
         }    
     } else if request.method == "POST" {
         match request.path.as_str() {
             path if path.starts_with("/files/") => {
-                let file_name= format!("/{}", path.strip_prefix("/files/").unwrap_or_else(|| ""));
+                let file_name= format!("/tmp/{}", path.strip_prefix("/files/").unwrap_or_default());
 
-                match fs::write(file_name, request.body.as_bytes()) {
+                println!("{}", file_name);
+
+                match fs::write(file_name, request.body.as_slice()) {
                     Ok(_) => { resp.set_status_code(StatusCode::Created); },
 
                     Err(e) => {
@@ -308,16 +330,17 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
                     }
                 }
             },
+
             _ => { resp.set_status_code(StatusCode::NotFound); }
         }
     } else {
         resp.set_status_code(StatusCode::InternalServerError);
     }
 
-    println!("{:?}", resp);
-
-    stream.write_all(resp.to_string().as_bytes())?;
+    stream.write_all(&resp.as_bytes())?;
     stream.flush()?;
+
+    println!("{}", resp);
 
     Ok(())
 }
@@ -333,7 +356,7 @@ fn main() {
             Ok(s) => { 
                 pool.execute(|| {
                     if let Err(e) = handle_client(s) {
-                        println!("{}", e);
+                        println!("Unable to Process Client Request: {}", e);
                     }
                 });
             },               
