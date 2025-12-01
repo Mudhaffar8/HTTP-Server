@@ -10,7 +10,7 @@ struct Worker {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-// Note: Use thread::Builder for Error Checking
+// TODO: Use thread::Builder for Error Checking
 impl Worker {
     pub fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let thread = thread::spawn(move || {

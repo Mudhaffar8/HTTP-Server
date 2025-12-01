@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::HttpRequest;
+    use crate::{HttpRequest, HttpResponse};
 
     #[test]
     fn parse_check_status_line() {
@@ -68,6 +68,35 @@ mod tests {
 
     #[test]
     fn gzip_test() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
 
+        let body = b"supercalifragilisticexpialidocious".to_vec();
+
+        let mut resp = HttpResponse::new();
+        let mut req = HttpRequest::new("GET", "/");
+
+        let mut encoder: GzEncoder<Vec<u8>> = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body.as_slice()).expect("GZIP Error");
+        let compressed_data = encoder.finish().expect("GZIP Error");
+
+        req.set_header("Accept-Encoding".to_owned(), "gzip, deflate, br, zstd".to_owned());
+        resp.set_body(body, &req).expect("GZIP Error");
+
+        assert_eq!(resp.body, compressed_data);
+    }
+
+    #[test]
+    fn no_compression_body() {
+        let body = b"supercalifragilisticexpialidocious";
+
+        let mut resp = HttpResponse::new();
+        let mut req = HttpRequest::new("GET", "/");
+
+        req.set_header("Accept-Encoding".to_owned(), "br, zstd".to_owned());
+        resp.set_body(body.to_vec(), &req).expect("I/O Error");
+
+        assert_eq!(resp.body, body);
     }
 }

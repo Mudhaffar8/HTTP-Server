@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+    /* Colours */
+    /* Primary Colours */
+    --c-primary-one: hsl(158, 36%, 37%);
+    --c-primary-two: hsl(30, 38%, 92%);
+
+    /* Neutral Colours */
+    --c-neutral-one: hsl(212, 21%, 14%);
+    --c-neutral-two: hsl(228, 12%, 48%);
+
+    /* Fonts */
+    /* Font Family */
+    --ff-primary: 'Fraunces', serif;
+    --ff-secondary: 'Montserrat', sans-serif;
+
+    --fs-base: 14px;
+}
+
+@layer base {
+    html { 
+        font-family: var(--ff-secondary);
+        font-size: var(--fs-base);
+    }
+}
+
+@layer components {
+    #preview-image {
+        content: url("../images/image-product-mobile.jpg");
+    }
+    @media (min-width: 640px) {
+        #preview-image {
+            content: url("../images/image-product-desktop.jpg");
+        }
+    }
+}
