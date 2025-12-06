@@ -17,14 +17,19 @@ use crate::threading::ThreadPool;
 
 use crate::constants::*;
 
+/// Represents a parsed HTTP Request received from a client.
 #[derive(Debug)]
 struct HttpRequest {
+    /// Currently supports GET and POST methods.
     method: String,
     path: String,
     headers: HashMap<String, String>,
     body: Vec<u8>
 }
 
+/// Represents errors that can occur while parsing an HTTP request.
+/// 
+/// For debugging purposes.
 #[derive(Debug, Clone, Copy)]
 enum ParseError {
     EmptyRequest,
@@ -34,6 +39,7 @@ enum ParseError {
     InvalidHeader
 }
 
+/// Represents an HTTP response that will be returned to the client.
 #[derive(Debug)]
 struct HttpResponse {
     status_code: StatusCode,
@@ -41,6 +47,9 @@ struct HttpResponse {
     body: Vec<u8>
 }
 
+/// HTTP status codes supported by this server.
+/// 
+/// Values correspond to their numeric meanings.
 #[repr(u32)]
 #[derive(Debug, Copy, Clone)]
 enum StatusCode {
@@ -51,6 +60,9 @@ enum StatusCode {
     InternalServerError  = 500
 }
 
+/// Used for serializing a status code.
+/// 
+/// Outputs status number and status message as part of HTTP status line.
 impl fmt::Display for StatusCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", *self as u32, match self {
@@ -64,9 +76,10 @@ impl fmt::Display for StatusCode {
 }
 
 impl HttpResponse {
+    /// Status defaults to 404.
     fn new() -> Self {
         Self {
-            status_code: StatusCode::Ok,
+            status_code: StatusCode::NotFound,
             headers: HashMap::new(),
             body: Vec::new()
         }
@@ -84,6 +97,10 @@ impl HttpResponse {
         self
     }
 
+    /// Sets HTTP response body and automatically applies gzip compression.
+    /// only if client indicates support via `Accept-Encoding` Header.
+    /// 
+    /// Additionally updates Content-Encoding and/or Content-Length Headers as appropriate.
     fn set_body(&mut self, contents: Vec<u8>, request: &HttpRequest) -> Result<(), std::io::Error> {
         if let Some(encoding) = request.headers.get("Accept-Encoding") {
             let is_gzip_enabled = encoding
@@ -95,11 +112,17 @@ impl HttpResponse {
             }
         }
 
+        self.set_header("Content-Length".to_owned(), contents.len().to_string());
         self.body = contents;
 
         Ok(())
     }
 
+    /// Performs gzip compression and updates body.
+    /// 
+    /// Additionally updates Content-Encoding and Content-Length Headers.
+    /// 
+    /// Used internally by `set_body()`.
     fn compress_body(&mut self, data: Vec<u8>) -> Result<(), std::io::Error> { 
         use flate2::write::GzEncoder;
         use flate2::Compression;
@@ -117,6 +140,8 @@ impl HttpResponse {
         Ok(())
     }
 
+
+    /// Serializes `HttpResponse` into HTTP/1.1 response byte buffer.
     fn as_bytes(&self) -> Vec<u8> {
         let mut response = Vec::with_capacity(self.body.len() + 250);
 
@@ -136,7 +161,8 @@ impl HttpResponse {
     }
 }
 
-// Strictly for Debugging
+/// **Strictly for Debugging**: Serializes Request status line and header into HTTP/1.1 format. 
+/// May not be suitable for network transmissions if body contains non-UTF-8 data.
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
@@ -150,7 +176,9 @@ impl fmt::Display for HttpResponse {
 }
 
 impl HttpRequest {
-    // Strictly for testing
+    /// **Strictly for testing**: Creates minimal `HttpRequest`.
+    /// TODO?: Refactor method var into enum.
+    #[cfg(test)]
     fn new(method: &str, path: &str) -> Self {
         Self {
             method: method.to_owned(),
@@ -160,18 +188,28 @@ impl HttpRequest {
         }
     }
 
-    // Strictly for testing
+    /// **Strictly for testing**: Adds or updates HTTP Response Headers.
+    #[cfg(test)]
     fn set_header(&mut self, key: String, val: String) -> &mut Self {
         self.headers.insert(key, val);
 
         self
     }
 
+    /// Creates a new `HttpRequest` by parsing a raw byte buffer.
+    /// 
+    /// # Returns
+    /// - `Ok(HttpRequest)` if buffer is successfully parsed.
+    /// - `Err(ParseError)` if request is malformed or is missing required components.
+    /// 
+    /// Note:
+    /// - Buffer must contain valid UTF-8 encoded headers and status line.
     fn new_from_buffer(buffer: &[u8]) -> Result<Self, ParseError> {
         let request_string = String::from_utf8_lossy(&buffer);
         
         let mut request_lines = request_string.lines();
 
+        // Ensure string exists
         let start_line_split = request_lines.next()
             .ok_or(ParseError::EmptyRequest)?
             .to_owned();
@@ -194,7 +232,7 @@ impl HttpRequest {
 
         let mut headers: HashMap<String, String> = HashMap::new();
 
-        // Parse all Headers and add to Hashmap
+        // Parse all Headers
         for line in request_lines.by_ref() {
             if line.is_empty() {
                 break;
@@ -230,7 +268,8 @@ impl HttpRequest {
     }
 }
 
-// Strictly for Debugging
+/// **Strictly for Debugging**: Serializes HTTP Request status line and headers into HTTP/1.1 format. 
+/// Not be suitable for network transmissions as body is not included and may contain non-UTF-8 data.
 impl fmt::Display for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
@@ -244,10 +283,44 @@ impl fmt::Display for HttpRequest {
     }
 }
 
+/// Checks whether a file system path is safe to serve
+/// 
+/// Path is considered safe iff it:
+/// - Does not contain `".."` components (prevents parent directory traversal)
+/// - Does not start with an absolute root
+/// - Does not contain prefix components (such as Windows `C:\` drives)
+fn is_path_safe(path : &str) -> bool
+{
+    use std::path::{Path, Component};
+
+    let path = Path::new(path);
+
+   for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+
+            Component::CurDir | Component::Normal(_) => continue
+        }
+   }
+
+    true
+}
+
+/// Handles a single client connection.
+/// 
+/// This function will:
+/// 1. Read incoming requests from a client.
+/// 2. Parse requests into an `HttpRequest`.
+/// 3. If parsed with no errors, generate appropriate `HttpResponse`.
+/// 4. Route request to handlers based on request path.
+/// 5. Send serialized response back to client.
+/// 
+/// Note:
+/// - Parsing errors result in connection being closed immediately.
 fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
     println!("Incoming Connection: {:?}", stream.peer_addr());
 
-    let mut buffer = [0u8; 1024];
+    let mut buffer = vec![0u8; 1024];
     let mut reader = BufReader::new(&stream);
 
     reader.read(&mut buffer)?;
@@ -259,7 +332,7 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
         resp.set_status_code(StatusCode::BadRequest);
         println!("{}", resp);
 
-        stream.write_all(resp.to_string().as_bytes())?;
+        stream.write_all(&resp.as_bytes())?;
         stream.flush()?;
 
         return Ok(());
@@ -268,58 +341,64 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
 
     if request.method == "GET" {
         match request.path.as_str() {
+            // Homepage
             "/" => {
-                // TODO: Fails silently, should fix
-                let contents = fs::read(PATH_TO_HOMEPAGE).unwrap_or_default();
-
-                resp
-                    .set_status_code(StatusCode::Ok)
-                    .set_header("Content-Type".to_owned(), "text/html".to_owned())
-                    .set_body(contents, &request)?;
+                if let Ok(contents) = fs::read(PATH_TO_HOMEPAGE) {
+                    resp
+                        .set_status_code(StatusCode::Ok)
+                        .set_header("Content-Type".to_owned(), "text/html".to_owned())
+                        .set_body(contents, &request)?;
+                }
             },
 
-            path if path.starts_with("/css") => {
-                let css_file_name = path.strip_prefix("/css/").unwrap_or("").to_owned();
+            // Handles Requests for CSS files
+            path if path.starts_with("/css/") => {
+                if let Some(css_file_name) = path.strip_prefix("/css/") {
+                    if is_path_safe(css_file_name) {
 
-                // TODO: Fails silently, should fix
-                let contents = fs::read(PATH_TO_CSS.to_owned() + &css_file_name).unwrap_or_default();
-
-                resp
-                    .set_status_code(StatusCode::Ok)
-                    .set_header("Content-Type".to_owned(), "text/css".to_owned())
-                    .set_body(contents, &request)?;
+                        if let Ok(contents) = fs::read(PATH_TO_CSS.to_owned() + &css_file_name) {                 
+                            resp
+                                .set_status_code(StatusCode::Ok)
+                                .set_header("Content-Type".to_owned(), "text/css".to_owned())
+                                .set_body(contents, &request)?;
+                        }
+                    }
+                }
             },
 
-            path if path.starts_with("/images") => {
-                let img_file_name = path.strip_prefix("/images/").unwrap_or("").to_owned();
+            // Handles Requests for Image Files (SVG and JPG supported)
+            path if path.starts_with("/images/") => {
+                if let Some(img_file_name) = path.strip_prefix("/images/") {
+                    if is_path_safe(img_file_name) {
 
-                // Accounting for different image file types
-                if img_file_name.ends_with(".svg") { resp.set_header("Content-Type".to_owned(), "image/svg+xml".to_owned()); }
-                else if img_file_name.ends_with(".jpg") { resp.set_header("Content-Type".to_owned(), "image/jpg".to_owned()); }
+                        // Accounting for different image file types
+                        if img_file_name.ends_with(".svg") { resp.set_header("Content-Type".to_owned(), "image/svg+xml".to_owned()); }
+                        else if img_file_name.ends_with(".jpg") { resp.set_header("Content-Type".to_owned(), "image/jpg".to_owned()); }
 
-                // TODO: Fails silently, should fix
-                let contents = fs::read(PATH_TO_IMAGES.to_owned() + &img_file_name).unwrap_or_default();
-
-                resp
-                    .set_status_code(StatusCode::Ok)
-                    .set_body(contents, &request)?;
+                        if let Ok(contents) = fs::read(PATH_TO_IMAGES.to_owned() + &img_file_name) {
+                            resp
+                                .set_status_code(StatusCode::Ok)
+                                .set_body(contents, &request)?;
+                        }
+                   }
+                }
             },
 
             // For testing concurrency
             "/sleep" => { 
-                let content = fs::read(PATH_TO_HOMEPAGE).unwrap_or_default();
+                if let Ok(content) = fs::read(PATH_TO_HOMEPAGE) {
                 
-                resp
-                    .set_status_code(StatusCode::Ok)
-                    .set_body(content, &request)?;
+                    resp
+                        .set_status_code(StatusCode::Ok)
+                        .set_body(content, &request)?;
 
-                thread::sleep(std::time::Duration::from_secs(5));
+                    thread::sleep(std::time::Duration::from_secs(5));
+                }
             },
 
             path if path.starts_with("/echo/") => {
+                // Will never default
                 let echo_string = path.strip_prefix("/echo/").unwrap_or("");
-
-                //println!("{:?}", compressed_data);
 
                 resp
                     .set_status_code(StatusCode::Ok)
@@ -328,25 +407,27 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
             },
 
             path if path.starts_with("/files/") => {
-                let file_path = format!("/tmp/{}", path.strip_prefix("/files/").unwrap_or_default());
+                // Will never default
+                if let Some(path) = path.strip_prefix("/files/") {
+                    let file_path = format!("/tmp/{}", path.strip_prefix("/files/").unwrap_or_default());
 
-                match fs::read(file_path.as_str()) {
-                    Ok(contents) => {
-                        resp
-                            .set_status_code(StatusCode::Ok)
-                            .set_header("Content-Type".to_owned(), "application/octet-stream".to_owned())
-                            .set_body(contents, &request)?; 
-                    },
-                    Err(e) => {
-                        println!("Error: {}", e);
-                        resp.set_status_code(StatusCode::NotFound);
-                    } 
+                    if is_path_safe(file_path.as_str()) {
+                        match fs::read(file_path.as_str()) {
+                            Ok(contents) => {
+                                resp
+                                    .set_status_code(StatusCode::Ok)
+                                    .set_header("Content-Type".to_owned(), "application/octet-stream".to_owned())
+                                    .set_body(contents, &request)?; 
+                            },
+                            Err(e) =>  { println!("Error: {}", e); }
+                        }
+                    }
                 }
             },
 
             path if path.starts_with("/user-agent") => {
                 let user_agent: Vec<u8> = request.headers.get("User-Agent")
-                    .unwrap_or(&"".to_owned()) 
+                    .unwrap_or(&"No User Agent".to_owned()) 
                     .as_bytes()
                     .to_vec();
 
@@ -357,12 +438,14 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
             },
 
             _ => { 
-                resp.set_status_code(StatusCode::InternalServerError); 
+                resp.set_status_code(StatusCode::NotFound); 
                 //println!("{}", request.path);
             }
         }    
     } else if request.method == "POST" {
         match request.path.as_str() {
+
+            // Writes content in request body to file
             path if path.starts_with("/files/") => {
                 let file_name= format!("/tmp/{}", path.strip_prefix("/files/").unwrap_or_default());
 
@@ -379,12 +462,10 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
             },
 
             _ => { 
-                resp.set_status_code(StatusCode::NotFound); 
+                //resp.set_status_code(StatusCode::NotFound); 
                 //println!("{}", request.path);
             }
         }
-    } else {
-        resp.set_status_code(StatusCode::InternalServerError);
     }
 
     stream.write_all(&resp.as_bytes())?;
@@ -406,9 +487,9 @@ fn main() {
         match stream {
             Ok(s) => { 
                 pool.execute(|| {
-                    if let Err(e) = handle_client(s) {
-                        println!("Unable to Process Client Request: {}", e);
-                    }
+                    handle_client(s).unwrap_or_else(|err|
+                        println!("Error processing client request: {}", err)
+                    );
                 });
             },               
             Err(e) => { println!("Error: {:?}", e); }
