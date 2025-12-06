@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::{HttpRequest, HttpResponse};
+    use crate::request::*;
+    use crate::response::*;
 
     #[test]
     fn parse_check_status_line() {

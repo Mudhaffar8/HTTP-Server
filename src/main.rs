@@ -1,287 +1,22 @@
 mod threading;
-mod tests;
 mod constants;
-
-extern crate flate2;
+mod tests;
+mod request;
+mod response;
 
 use std::{
-    collections::HashMap, 
     fs, 
     io::{BufReader, Read, Write}, 
     net::{TcpListener, TcpStream}, 
-    thread, 
-    fmt
+    thread
 };
 
-use crate::threading::ThreadPool;
+extern crate flate2;
 
 use crate::constants::*;
-
-/// Represents a parsed HTTP Request received from a client.
-#[derive(Debug)]
-struct HttpRequest {
-    /// Currently supports GET and POST methods.
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>
-}
-
-/// Represents errors that can occur while parsing an HTTP request.
-/// 
-/// For debugging purposes.
-#[derive(Debug, Clone, Copy)]
-enum ParseError {
-    EmptyRequest,
-    EmptyMethod,
-    EmptyPath,
-    EmptyHttpVersion, 
-    InvalidHeader
-}
-
-/// Represents an HTTP response that will be returned to the client.
-#[derive(Debug)]
-struct HttpResponse {
-    status_code: StatusCode,
-    headers: HashMap<String, String>,
-    body: Vec<u8>
-}
-
-/// HTTP status codes supported by this server.
-/// 
-/// Values correspond to their numeric meanings.
-#[repr(u32)]
-#[derive(Debug, Copy, Clone)]
-enum StatusCode {
-    Ok = 200,
-    Created = 201,
-    BadRequest = 400,
-    NotFound = 404,
-    InternalServerError  = 500
-}
-
-/// Used for serializing a status code.
-/// 
-/// Outputs status number and status message as part of HTTP status line.
-impl fmt::Display for StatusCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", *self as u32, match self {
-            StatusCode::Ok => "OK",
-            StatusCode::Created => "Created",
-            StatusCode::NotFound => "Not Found",
-            StatusCode::BadRequest => "Bad Request",
-            StatusCode::InternalServerError => "Internal Server Error"
-        })
-    }
-}
-
-impl HttpResponse {
-    /// Status defaults to 404.
-    fn new() -> Self {
-        Self {
-            status_code: StatusCode::NotFound,
-            headers: HashMap::new(),
-            body: Vec::new()
-        }
-    }
-
-    fn set_status_code(&mut self, status_code: StatusCode) -> &mut Self {
-        self.status_code = status_code;
-
-        self
-    }
-
-    fn set_header(&mut self, key: String, val: String) -> &mut Self {
-        self.headers.insert(key, val);
-
-        self
-    }
-
-    /// Sets HTTP response body and automatically applies gzip compression.
-    /// only if client indicates support via `Accept-Encoding` Header.
-    /// 
-    /// Additionally updates Content-Encoding and/or Content-Length Headers as appropriate.
-    fn set_body(&mut self, contents: Vec<u8>, request: &HttpRequest) -> Result<(), std::io::Error> {
-        if let Some(encoding) = request.headers.get("Accept-Encoding") {
-            let is_gzip_enabled = encoding
-                .split(", ")
-                .any(|compression_mode| compression_mode == "gzip");
-
-            if is_gzip_enabled {
-                return self.compress_body(contents);
-            }
-        }
-
-        self.set_header("Content-Length".to_owned(), contents.len().to_string());
-        self.body = contents;
-
-        Ok(())
-    }
-
-    /// Performs gzip compression and updates body.
-    /// 
-    /// Additionally updates Content-Encoding and Content-Length Headers.
-    /// 
-    /// Used internally by `set_body()`.
-    fn compress_body(&mut self, data: Vec<u8>) -> Result<(), std::io::Error> { 
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let mut encoder: GzEncoder<Vec<u8>> = GzEncoder::new(Vec::new(), Compression::default());
-
-        encoder.write_all(data.as_slice())?;
-        let compressed_data = encoder.finish()?;
-
-        self.set_header("Content-Encoding".to_owned(), "gzip".to_owned());
-        self.set_header("Content-Length".to_owned(), compressed_data.len().to_string());
-
-        self.body = compressed_data;
-
-        Ok(())
-    }
-
-
-    /// Serializes `HttpResponse` into HTTP/1.1 response byte buffer.
-    fn as_bytes(&self) -> Vec<u8> {
-        let mut response = Vec::with_capacity(self.body.len() + 250);
-
-        response.extend_from_slice(format!("HTTP/1.1 {}\r\n", self.status_code).as_bytes());
-
-        for (key, val) in self.headers.iter() {
-            response.extend_from_slice(key.as_bytes());
-            response.extend_from_slice(b": ");
-            response.extend_from_slice(val.as_bytes());
-            response.extend_from_slice(b"\r\n");
-        }   
-
-        response.extend_from_slice(b"\r\n");
-        response.extend_from_slice(self.body.as_slice());   
-          
-        response 
-    }
-}
-
-/// **Strictly for Debugging**: Serializes Request status line and header into HTTP/1.1 format. 
-/// May not be suitable for network transmissions if body contains non-UTF-8 data.
-impl fmt::Display for HttpResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f,
-            "HTTP/1.1 {}\r\n\
-            {}\
-            \r\n",
-            self.status_code.to_string(),
-            self.headers.iter().map(|(s, k)| format!("{s}: {k}\r\n")).collect::<String>(),
-        )
-    }
-}
-
-impl HttpRequest {
-    /// **Strictly for testing**: Creates minimal `HttpRequest`.
-    /// TODO?: Refactor method var into enum.
-    #[cfg(test)]
-    fn new(method: &str, path: &str) -> Self {
-        Self {
-            method: method.to_owned(),
-            path: path.to_owned(),
-            headers: HashMap::new(),
-            body: Vec::new()
-        }
-    }
-
-    /// **Strictly for testing**: Adds or updates HTTP Response Headers.
-    #[cfg(test)]
-    fn set_header(&mut self, key: String, val: String) -> &mut Self {
-        self.headers.insert(key, val);
-
-        self
-    }
-
-    /// Creates a new `HttpRequest` by parsing a raw byte buffer.
-    /// 
-    /// # Returns
-    /// - `Ok(HttpRequest)` if buffer is successfully parsed.
-    /// - `Err(ParseError)` if request is malformed or is missing required components.
-    /// 
-    /// Note:
-    /// - Buffer must contain valid UTF-8 encoded headers and status line.
-    fn new_from_buffer(buffer: &[u8]) -> Result<Self, ParseError> {
-        let request_string = String::from_utf8_lossy(&buffer);
-        
-        let mut request_lines = request_string.lines();
-
-        // Ensure string exists
-        let start_line_split = request_lines.next()
-            .ok_or(ParseError::EmptyRequest)?
-            .to_owned();
-
-        let mut parts = start_line_split.split_whitespace();
-
-        // Check Method exists in string
-        let method = parts.next()
-            .ok_or(ParseError::EmptyMethod)?
-            .to_owned();
-
-            
-        // Check path exists in string
-        let path = parts.next()    
-            .ok_or(ParseError::EmptyPath)?
-            .to_owned();
-
-        // Check if HTTP Version exists
-        let _http_version = parts.next().ok_or(ParseError::EmptyHttpVersion)?;
-
-        let mut headers: HashMap<String, String> = HashMap::new();
-
-        // Parse all Headers
-        for line in request_lines.by_ref() {
-            if line.is_empty() {
-                break;
-            }
-
-            let mut header_split = line.split(": ");
-
-            let (Some(key), Some(val)) = (header_split.next(), header_split.next()) else {
-                // Make this continue instead?
-                return Err(ParseError::InvalidHeader);
-            };
-            
-            headers.insert(key.to_owned(), val.to_owned());
-        }
-
-        let body = request_lines.next()
-            .and_then(|s| 
-                headers.get("Content-Length").and_then(|val| {
-                    let len = val.parse::<usize>().unwrap_or_default();
-                    Some(s[0..len].to_owned())
-                })
-            )
-            .unwrap_or_default()
-            .as_bytes()
-            .to_vec();
-
-        Ok(Self { 
-            method,
-            path,
-            headers, 
-            body
-        })
-    }
-}
-
-/// **Strictly for Debugging**: Serializes HTTP Request status line and headers into HTTP/1.1 format. 
-/// Not be suitable for network transmissions as body is not included and may contain non-UTF-8 data.
-impl fmt::Display for HttpRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f,
-            "{} {} HTTP/1.1\r\n\
-            {}\
-            \r\n",
-            self.method,
-            self.path,
-            self.headers.iter().map(|(s, k)| format!("{s}: {k}\r\n")).collect::<String>(),
-        )
-    }
-}
+use crate::request::*;
+use crate::response::*;
+use crate::threading::ThreadPool;
 
 /// Checks whether a file system path is safe to serve
 /// 
@@ -289,8 +24,7 @@ impl fmt::Display for HttpRequest {
 /// - Does not contain `".."` components (prevents parent directory traversal)
 /// - Does not start with an absolute root
 /// - Does not contain prefix components (such as Windows `C:\` drives)
-fn is_path_safe(path : &str) -> bool
-{
+fn is_path_safe(path : &str) -> bool {
     use std::path::{Path, Component};
 
     let path = Path::new(path);
