@@ -15,6 +15,12 @@ pub enum ParseError {
     InvalidHeader
 }
 
+pub enum HttpMethod {
+    GET,
+    POST,
+    HEAD
+}
+
 /// Represents a parsed HTTP Request received from a client.
 #[derive(Debug)]
 pub struct HttpRequest {
@@ -26,7 +32,7 @@ pub struct HttpRequest {
 }
 
 /// **Strictly for Debugging**: Serializes HTTP Request status line and headers into HTTP/1.1 format. 
-/// Not be suitable for network transmissions as body is not included and may contain non-UTF-8 data.
+/// Not suitable for network transmissions as body is not included as body may contain non-UTF-8 data.
 impl fmt::Display for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
@@ -41,8 +47,8 @@ impl fmt::Display for HttpRequest {
 }
 
 /*
-- Add 404 message
-- Add methods for configuring common HTTP Response formats
+- Add new_404 method for more clarity?
+- Add methods for configuring common HTTP responses:
     - CSS, HTML, Images, JSON Data
 */
 impl HttpRequest {

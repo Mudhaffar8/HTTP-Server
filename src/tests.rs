@@ -2,6 +2,7 @@
 mod tests {
     use crate::request::*;
     use crate::response::*;
+    use crate::utils::is_path_safe;
 
     #[test]
     fn parse_check_status_line() {
@@ -99,5 +100,19 @@ mod tests {
         resp.set_body(body.to_vec(), &req).expect("I/O Error");
 
         assert_eq!(resp.body, body);
+    }
+
+    #[test]
+    fn safe_path() {
+        let safe_path = "images/more_images/banana.jpg";
+
+        assert!(is_path_safe(safe_path));
+    }
+
+    #[test]
+    fn unsafe_path_parent_travesal() {
+        let unsafe_path = "../images";
+
+        assert!(!is_path_safe(unsafe_path));
     }
 }

@@ -4,7 +4,7 @@ pub const ADDRESS: &'static str = concat!("127.0.0.1", ":", "2109");
 // Thread pool config
 pub const NUM_OF_THREADS: usize = 6;
 
-// Suported compression modes
+// Supported compression modes
 pub const VALID_COMPRESSION_MODES: [&'static str; 1] = ["gzip"];
 
 // Paths to website assets

@@ -42,8 +42,8 @@ pub struct HttpResponse {
     pub body: Vec<u8>
 }
 
-/// **Strictly for Debugging**: Serializes Request status line and header into HTTP/1.1 format. 
-/// May not be suitable for network transmissions if body contains non-UTF-8 data.
+/// **Strictly for Debugging**: Serializes HTTP request status line and headers into HTTP/1.1 format. 
+/// Not suitable for network transmissions as body is not included and body may contain non-UTF-8 data.
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,

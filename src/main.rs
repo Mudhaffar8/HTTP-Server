@@ -1,8 +1,10 @@
-mod threading;
 mod constants;
-mod tests;
-mod request;
 mod response;
+mod request;
+mod router;
+mod tests;
+mod threading;
+mod utils;
 
 use std::{
     fs, 
@@ -14,31 +16,10 @@ use std::{
 extern crate flate2;
 
 use crate::constants::*;
-use crate::request::*;
 use crate::response::*;
+use crate::request::*;
 use crate::threading::ThreadPool;
-
-/// Checks whether a file system path is safe to serve
-/// 
-/// Path is considered safe iff it:
-/// - Does not contain `".."` components (prevents parent directory traversal)
-/// - Does not start with an absolute root
-/// - Does not contain prefix components (such as Windows `C:\` drives)
-fn is_path_safe(path : &str) -> bool {
-    use std::path::{Path, Component};
-
-    let path = Path::new(path);
-
-   for component in path.components() {
-        match component {
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
-
-            Component::CurDir | Component::Normal(_) => continue
-        }
-   }
-
-    true
-}
+use crate::utils::*;
 
 /// Handles a single client connection.
 /// 
